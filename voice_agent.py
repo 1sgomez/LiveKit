@@ -257,6 +257,11 @@ class LocalVoiceAgent:
                                 "Si el usuario dice 'muéstrame en pantalla', 'ponlo en la pantalla', "
                                 "'quiero verlo' o similar, responde normalmente pero agrega al FINAL: "
                                 "[COMANDO:MOSTRAR]. Esto hará que tu respuesta se muestre visualmente."
+                                "⚠️ REGLA CRÍTICA: "
+                                "Si hay datos de herramientas disponibles, SOLO puedes usar ESA información. "
+                                "NO uses información del historial de conversación. "
+                                "Haz una conversion de JSON a informacion real, nunca respondas en codigo o formato JSON"
+                                "NO inventes informacion relacionada con formularios."
                                 + tool_context
                             },
                             *self.conversation_history
@@ -288,10 +293,16 @@ class LocalVoiceAgent:
                 mp3_path = f.name
                 tts.save(mp3_path)
 
-            audio = AudioSegment.from_mp3(mp3_path).set_frame_rate(16000).set_channels(1)
+            audio = (
+                AudioSegment.from_mp3(mp3_path)
+                .set_frame_rate(16000)
+                .set_channels(1)
+                .set_sample_width(2)  # 🔥 PCM16
+            )
+
             os.unlink(mp3_path)
 
-            return audio.raw_data
+            return audio.raw_data  # ahora SÍ es PCM16 LE
 
         except Exception as e:
             logger.error(f"❌ Error TTS: {e}")
@@ -331,7 +342,7 @@ class LocalVoiceAgent:
     async def publish_audio(self, audio_data: bytes):
         """Publicar audio en la sala"""
         try:
-            sample_rate = 22050
+            sample_rate = 16000
             source = rtc.AudioSource(sample_rate, 1)
             track = rtc.LocalAudioTrack.create_audio_track("agent-voice", source)
 
@@ -449,7 +460,7 @@ class LocalVoiceAgent:
                     else:
                         logger.info("❌ No se detectó comando")
 
-                    audio_response = await self.synthesize_speech(response)
+                    audio_response = await self.synthesize_speech(clean_response)
                     if audio_response:
                         await self.publish_audio(audio_response)
                 else:
