@@ -5,27 +5,112 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Voice Client</title>
     <script src="https://unpkg.com/livekit-client/dist/livekit-client.umd.js"></script>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        padding: 20px;
+        max-width: 800px;
+        margin: 0 auto;
+      }
+      textarea {
+        width: 100%;
+        padding: 10px;
+        font-family: monospace;
+      }
+      button {
+        padding: 10px 20px;
+        margin: 10px 5px;
+        cursor: pointer;
+      }
+      #messageDisplay {
+        margin-top: 20px;
+        padding: 15px;
+        border: 2px solid #4caf50;
+        border-radius: 5px;
+        background-color: #f0f9ff;
+        font-size: 18px;
+        display: none;
+      }
+      #status {
+        padding: 10px;
+        background: #e8f5e9;
+        border-radius: 5px;
+        margin-bottom: 20px;
+      }
+    </style>
   </head>
   <body>
+    <h1>🎙️ Voice Client con Comandos</h1>
+
+    <div id="status">🔴 Desconectado</div>
+
+    <h3>Enviar datos de herramientas:</h3>
     <textarea
       id="toolData"
       placeholder='{"tool_name": "driver.js", "data": {...}}'
       rows="10"
-      cols="50"
     ></textarea>
     <br />
-    <button onclick="enviarDatos()">Enviar</button>
+    <button onclick="enviarDatos()">Enviar Datos</button>
+
+    <!-- 🆕 Área para mostrar mensajes del agente -->
+    <div id="messageDisplay"></div>
 
     <script>
-      function mostrarMensaje(mens) {
-        alert(mens);
-      }
-
       let sala = null;
       let userIdentity = null;
       let roomName = "test";
 
-      // 🆕 Función DIRECTA a LiveKit (sin pasar por Flask)
+      // 🆕 Funciones que el agente puede ejecutar
+      function mostrarMensaje(mens) {
+        console.log("🖥️ EJECUTANDO mostrarMensaje():", mens);
+
+        const display = document.getElementById("messageDisplay");
+        display.textContent = "🤖 " + mens;
+        display.style.display = "block";
+
+        // Auto-ocultar después de 10 segundos
+        setTimeout(() => {
+          display.style.display = "none";
+        }, 10000);
+      }
+
+      function ejecutarAlerta(mens) {
+        console.log("⚠️ EJECUTANDO ejecutarAlerta():", mens);
+        alert("🤖 Jarvis dice: " + mens);
+      }
+
+      function mostrarNotificacion(mens) {
+        console.log("🔔 EJECUTANDO mostrarNotificacion():", mens);
+        if (Notification.permission === "granted") {
+          new Notification("Jarvis", { body: mens });
+        }
+      }
+
+      // 🆕 Procesador de comandos del agente
+      function procesarComandoAgente(command, data) {
+        console.log(`🎯 PROCESANDO COMANDO: ${command}`);
+        console.log("📦 Datos:", data);
+
+        switch (command) {
+          case "mostrar_mensaje":
+            mostrarMensaje(data);
+            break;
+
+          case "alerta":
+            ejecutarAlerta(data);
+            break;
+
+          case "notificacion":
+            mostrarNotificacion(data);
+            break;
+
+          default:
+            console.warn(`⚠️ Comando desconocido: ${command}`);
+        }
+      }
+
+      // Función global para enviar datos desde cualquier lugar
       window.sendToolData = async function (toolName, data) {
         if (!sala || !sala.localParticipant) {
           console.error("❌ No conectado a la sala");
@@ -40,21 +125,19 @@
             user_identity: userIdentity,
           };
 
-          // 🔥 ENVIAR DIRECTAMENTE VÍA LIVEKIT
           const encoder = new TextEncoder();
           const dataBytes = encoder.encode(JSON.stringify(payload));
 
           await sala.localParticipant.publishData(dataBytes, {
             reliable: true,
-            destinationIdentities: [], // Broadcast a todos
+            destinationIdentities: [],
           });
 
           console.log(
             `✅ Datos de ${toolName} enviados directamente a LiveKit`
           );
-          console.log("📦 Payload:", payload);
 
-          // 🆕 OPCIONAL: También enviar a Flask para logging/storage
+          // Opcional: También enviar a Flask para logging
           await fetch("http://localhost:5000/tool-data", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -73,7 +156,7 @@
         }
       };
 
-      // Escuchar mensajes desde otros contextos (iframes, windows, etc)
+      // Escuchar mensajes desde otros contextos
       window.addEventListener("message", function (event) {
         if (event.data.type === "send_tool_data") {
           window.sendToolData(event.data.tool_name, event.data.data);
@@ -114,15 +197,29 @@
             }
           });
 
-          // 🆕 ESCUCHAR data messages (opcional, para debugging)
+          // 🆕 ESCUCHAR comandos del agente
           sala.on("dataReceived", (payload, participant) => {
+            console.log("📨 dataReceived evento disparado");
+            console.log("   Participante:", participant?.identity);
+            console.log("   Payload size:", payload.byteLength, "bytes");
+
             try {
               const decoder = new TextDecoder();
               const text = decoder.decode(payload);
+              console.log("   Texto decodificado:", text);
+
               const data = JSON.parse(text);
-              console.log("📨 Data recibida:", data);
+              console.log("   JSON parseado:", data);
+
+              // 🔥 Si es un comando del agente, ejecutarlo
+              if (data.type === "agent_command") {
+                console.log("✅ Es un comando del agente!");
+                procesarComandoAgente(data.command, data.data);
+              } else {
+                console.log("ℹ️ No es un comando del agente, type:", data.type);
+              }
             } catch (err) {
-              console.log("📨 Data recibida (no JSON):", payload);
+              console.error("❌ Error procesando data:", err);
             }
           });
 
@@ -132,10 +229,24 @@
           });
 
           await sala.localParticipant.setMicrophoneEnabled(true);
+
+          document.getElementById("status").textContent =
+            "✅ Conectado: " + nombre;
+          document.getElementById("status").style.background = "#e8f5e9";
+
           console.log("✅ Conectado:", nombre);
           console.log("📍 Sala:", roomName);
+          console.log("🎧 Listeners registrados");
+
+          // Pedir permiso para notificaciones
+          if (Notification.permission === "default") {
+            Notification.requestPermission();
+          }
         } catch (err) {
           console.error("Error:", err);
+          document.getElementById("status").textContent =
+            "❌ Error de conexión";
+          document.getElementById("status").style.background = "#ffebee";
         }
       }
 

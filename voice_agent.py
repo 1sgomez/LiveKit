@@ -233,7 +233,7 @@ class LocalVoiceAgent:
                 async with session.post(
                     "http://localhost:11434/api/chat",
                     json={
-                        "model": "llama3.2:3b",
+                        "model": "gemma3:1b",
                         "options": {
                             "temperature": 0.2,
                             "top_p": 0.9,
@@ -252,8 +252,12 @@ class LocalVoiceAgent:
                                 "Cuando tengas información de campos/formularios en el contexto, "
                                 "úsala EXACTAMENTE como te la proporcionan. "
                                 "Si te preguntan por un campo específico, busca ese nombre en los datos "
-                                "y responde con su descripción."
-                                + tool_context  # 🆕 Agregar contexto de herramientas
+                                "y responde con su descripción. "
+                                "\n\n🖥️ COMANDOS VISUALES: "
+                                "Si el usuario dice 'muéstrame en pantalla', 'ponlo en la pantalla', "
+                                "'quiero verlo' o similar, responde normalmente pero agrega al FINAL: "
+                                "[COMANDO:MOSTRAR]. Esto hará que tu respuesta se muestre visualmente."
+                                + tool_context
                             },
                             *self.conversation_history
                         ],
@@ -292,6 +296,37 @@ class LocalVoiceAgent:
         except Exception as e:
             logger.error(f"❌ Error TTS: {e}")
             return None
+
+    async def send_command_to_frontend(self, command: str, data: any = None):
+        """
+        🆕 Enviar comandos al frontend vía data messages
+        """
+        try:
+            if not self.ctx_room or not self.ctx_room.local_participant:
+                logger.warning("⚠️ No hay sala para enviar comando")
+                return
+
+            payload = {
+                'type': 'agent_command',
+                'command': command,
+                'data': data
+            }
+
+            logger.info(f"📤 Preparando comando: {json.dumps(payload, ensure_ascii=False)[:100]}")
+
+            payload_bytes = json.dumps(payload).encode('utf-8')
+
+            await self.ctx_room.local_participant.publish_data(
+                payload_bytes,
+                reliable=True
+            )
+
+            logger.info(f"✅ Comando '{command}' enviado exitosamente")
+
+        except Exception as e:
+            logger.error(f"❌ Error enviando comando: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def publish_audio(self, audio_data: bytes):
         """Publicar audio en la sala"""
@@ -398,6 +433,22 @@ class LocalVoiceAgent:
 
                 if text:
                     response = await self.generate_response(text)
+
+                    # AGREGAR ESTO:
+                    logger.info(f"🔍 DEBUG - Respuesta: '{response}'")
+                    logger.info(f"🔍 DEBUG - Upper: '{response.upper()}'")
+                    logger.info(f"🔍 DEBUG - Contiene?: {('[COMANDO:MOSTRAR]' in response.upper())}")
+
+                    should_display = '[COMANDO:MOSTRAR]' in response.upper()
+                    clean_response = response.replace('[COMANDO:MOSTRAR]', '').replace('[comando:mostrar]', '').strip()
+
+                    if should_display:
+                        logger.info("🖥️ INTENTANDO ENVIAR COMANDO")
+                        await self.send_command_to_frontend('mostrar_mensaje', clean_response)
+                        logger.info("✅ Comando enviado")
+                    else:
+                        logger.info("❌ No se detectó comando")
+
                     audio_response = await self.synthesize_speech(response)
                     if audio_response:
                         await self.publish_audio(audio_response)
