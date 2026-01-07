@@ -1,0 +1,16 @@
+livekit
+livekit-api
+livekit-protocol
+livekit-agents[silero,turn-detector]~=1.3
+livekit-plugins-noise-cancellation~=0.2
+livekit-plugins-openai
+livekit-plugins-deepgram
+livekit-plugins-elevenlabs
+livekit-plugins-silero
+openai-whisper
+piper-tts
+gtts
+flask
+flask-cors
+requests
+python-dotenv

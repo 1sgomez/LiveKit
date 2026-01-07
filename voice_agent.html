@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cliente de Voz LiveKit</title>
+
+    <!-- LiveKit Client desde CDN (más confiable) -->
+    <script src="https://unpkg.com/livekit-client/dist/livekit-client.umd.js"></script>
+
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          sans-serif;
+        max-width: 600px;
+        margin: 50px auto;
+        padding: 20px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        min-height: 100vh;
+      }
+
+      .container {
+        background: white;
+        padding: 40px;
+        border-radius: 20px;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      }
+
+      h1 {
+        color: #333;
+        margin-bottom: 10px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .subtitle {
+        color: #666;
+        margin-bottom: 30px;
+        font-size: 14px;
+      }
+
+      .button-group {
+        display: flex;
+        gap: 15px;
+        margin: 20px 0;
+      }
+
+      button {
+        flex: 1;
+        padding: 18px 25px;
+        font-size: 16px;
+        font-weight: 600;
+        border: none;
+        border-radius: 12px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+      }
+
+      #connect {
+        background: linear-gradient(135deg, #4caf50 0%, #45a049 100%);
+        color: white;
+      }
+
+      #connect:hover:not(:disabled) {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 20px rgba(76, 175, 80, 0.4);
+      }
+
+      #disconnect {
+        background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%);
+        color: white;
+      }
+
+      #disconnect:hover:not(:disabled) {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 20px rgba(244, 67, 54, 0.4);
+      }
+
+      button:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      #status {
+        margin-top: 25px;
+        padding: 20px;
+        border-radius: 12px;
+        font-weight: 600;
+        text-align: center;
+        background: #f5f5f5;
+        border-left: 5px solid #ccc;
+      }
+
+      #status.connecting {
+        background: #fff3cd;
+        border-left-color: #ffc107;
+        color: #856404;
+      }
+
+      #status.connected {
+        background: #d4edda;
+        border-left-color: #28a745;
+        color: #155724;
+      }
+
+      #status.error {
+        background: #f8d7da;
+        border-left-color: #dc3545;
+        color: #721c24;
+      }
+
+      #status.listening {
+        background: #cce5ff;
+        border-left-color: #007bff;
+        color: #004085;
+      }
+
+      .audio-container {
+        margin-top: 20px;
+        padding: 15px;
+        background: #f8f9fa;
+        border-radius: 10px;
+      }
+
+      #audio {
+        width: 100%;
+        margin-top: 10px;
+      }
+
+      .logs {
+        margin-top: 30px;
+        padding: 20px;
+        background: #1e1e1e;
+        border-radius: 12px;
+        max-height: 250px;
+        overflow-y: auto;
+        font-family: "Monaco", "Consolas", monospace;
+        font-size: 12px;
+      }
+
+      .logs h3 {
+        color: #fff;
+        margin: 0 0 15px 0;
+        font-size: 14px;
+      }
+
+      .log-entry {
+        color: #0f0;
+        margin: 5px 0;
+        padding: 3px 0;
+        border-bottom: 1px solid #333;
+      }
+
+      .log-entry.error {
+        color: #ff6b6b;
+      }
+
+      .log-entry.info {
+        color: #74b9ff;
+      }
+
+      .log-entry.warning {
+        color: #fdcb6e;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>🎤 Cliente de Voz LiveKit</h1>
+      <p class="subtitle">Conecta y habla con el agente Jarvis</p>
+
+      <div class="button-group">
+        <button id="connect" onclick="conectar()">
+          <span>📞</span> Conectar
+        </button>
+        <button id="disconnect" onclick="desconectar()" disabled>
+          <span>📴</span> Desconectar
+        </button>
+      </div>
+
+      <div id="status">Desconectado</div>
+
+      <div class="audio-container">
+        <label><strong>🔊 Audio del Agente:</strong></label>
+        <audio id="audio" controls></audio>
+      </div>
+
+      <div class="logs" id="logs">
+        <h3>📋 Logs de Conexión</h3>
+        <div id="log-content"></div>
+      </div>
+    </div>
+
+    <script>
+      // Variables globales
+      let sala = null;
+      const LOGS_DIR = "log-content";
+
+      // Referencias al DOM
+      const statusEl = document.getElementById("status");
+      const connectBtn = document.getElementById("connect");
+      const disconnectBtn = document.getElementById("disconnect");
+      const audioEl = document.getElementById("audio");
+      const logContent = document.getElementById("log-content");
+
+      // === FUNCIONES DE LOG ===
+      function addLog(message, type = "info") {
+        const timestamp = new Date().toLocaleTimeString();
+        const entry = document.createElement("div");
+        entry.className = `log-entry ${type}`;
+        entry.textContent = `[${timestamp}] ${message}`;
+        logContent.insertBefore(entry, logContent.firstChild);
+
+        // Mantener solo últimos 50 logs
+        while (logContent.children.length > 50) {
+          logContent.removeChild(logContent.lastChild);
+        }
+
+        console.log(`[${type.toUpperCase()}] ${message}`);
+      }
+
+      function updateStatus(text, className = "") {
+        statusEl.textContent = text;
+        statusEl.className = className;
+      }
+
+      // === CONEXIÓN ===
+      async function conectar() {
+        try {
+          // Verificar librería LiveKit
+          if (!window.LivekitClient) {
+            addLog(
+              "❌ Error: LiveKit no se cargó. Recarga la página.",
+              "error"
+            );
+            updateStatus("❌ Error: LiveKit no cargado", "error");
+            return;
+          }
+
+          addLog("✅ LiveKit cargado correctamente", "info");
+
+          // Actualizar estado
+          updateStatus("🔄 Conectando al servidor...", "connecting");
+          connectBtn.disabled = true;
+
+          // Generar nombre único para el participante
+          const nombre = "usuario-" + Math.random().toString(36).substring(7);
+          const roomName = "test";
+
+          addLog(`👤 Usuario: ${nombre}`, "info");
+          addLog(`🚪 Sala: ${roomName}`, "info");
+
+          // Obtener token del servidor
+          updateStatus("🔄 Obteniendo token...", "connecting");
+          addLog("📡 Solicitando token al servidor...", "info");
+
+          const tokenUrl = `http://localhost:5000/token?room=${encodeURIComponent(
+            roomName
+          )}&name=${encodeURIComponent(nombre)}`;
+          addLog(`🌐 URL: ${tokenUrl}`, "info");
+
+          const res = await fetch(tokenUrl);
+
+          if (!res.ok) {
+            throw new Error(`Error HTTP: ${res.status}`);
+          }
+
+          const datos = await res.json();
+
+          if (datos.error) {
+            throw new Error(datos.error);
+          }
+
+          addLog(`✅ Token recibido`, "info");
+          addLog(`🔗 WS URL: ${datos.url}`, "info");
+          addLog(`🏠 Room: ${datos.room}`, "info");
+
+          // Extraer componentes del token para mostrar info
+          try {
+            const payload = JSON.parse(atob(datos.token.split(".")[1]));
+            addLog(
+              `👤 Identity: ${
+                payload.sub || payload.identity || "desconocido"
+              }`,
+              "info"
+            );
+          } catch (e) {
+            addLog("⚠️ No se pudo decodificar token", "warning");
+          }
+
+          // Crear sala
+          updateStatus("🔄 Conectando a LiveKit...", "connecting");
+          const { Room } = window.LivekitClient;
+          sala = new Room();
+
+          addLog("🏗️ Sala creada", "info");
+
+          // Configurar eventos de la sala
+          setupRoomEvents();
+
+          // Conectar a LiveKit
+          addLog("🔌 Conectando a LiveKit...", "info");
+          addLog(`   URL: ${datos.url}`, "info");
+          addLog(`   Token: ${datos.token.substring(0, 50)}...`, "info");
+
+          await sala.connect(datos.url, datos.token, {
+            autoSubscribe: true,
+            dynacast: false,
+          });
+
+          addLog("✅ ¡Conectado exitosamente!", "info");
+          updateStatus("✅ ¡Conectado! Esperando al agente...", "connected");
+
+          // Activar micrófono
+          addLog("🎤 Activando micrófono...", "info");
+          await sala.localParticipant.setMicrophoneEnabled(true);
+          addLog("✅ Micrófono activado", "info");
+
+          // Actualizar botones
+          connectBtn.disabled = true;
+          disconnectBtn.disabled = false;
+
+          addLog("🎉 ¡Listo para hablar!", "info");
+        } catch (err) {
+          console.error("Error completo:", err);
+          addLog(`❌ Error: ${err.message}`, "error");
+          addLog(`📋 Stack: ${err.stack}`, "error");
+          updateStatus(`❌ Error: ${err.message}`, "error");
+
+          // Resetear botones
+          connectBtn.disabled = false;
+          disconnectBtn.disabled = true;
+          sala = null;
+        }
+      }
+
+      function setupRoomEvents() {
+        if (!sala) return;
+
+        // Evento: Conectado a la sala
+        sala.on("connected", () => {
+          addLog("📍 Evento: connected - Sala conectada", "info");
+          updateStatus(`✅ Conectado a: ${sala.name}`, "connected");
+        });
+
+        // Evento: Participante conectado
+        sala.on("participantConnected", (participant) => {
+          addLog(`👤 Participante conectado: ${participant.identity}`, "info");
+          addLog(
+            `   Es agente: ${
+              participant.identity.includes("agent") || participant.isAgent
+            }`,
+            "info"
+          );
+
+          if (participant.isAgent || participant.identity.includes("agent")) {
+            updateStatus("🤖 ¡Agente conectado!", "listening");
+            addLog("🤖 AGENTE DETECTADO - ¡Hola Jarvis!", "info");
+          }
+        });
+
+        // Evento: Track recibido (audio/video)
+        sala.on("trackSubscribed", (track, publication, participant) => {
+          addLog(
+            `🎧 Track recibido de ${participant.identity}: ${track.kind}`,
+            "info"
+          );
+
+          if (track.kind === "audio") {
+            addLog("🔊 Audio del agente recibido - adjuntando...", "info");
+
+            // Adjuntar audio al elemento
+            const audioElement = track.attach();
+            audioEl.srcObject = audioElement.srcObject || null;
+
+            // Si hay stream, adjuntarlo
+            if (track.stream) {
+              audioEl.srcObject = track.stream;
+            }
+
+            // Reproducir
+            audioEl.play().catch((err) => {
+              addLog(
+                `⚠️ No se pudo reproducir audio automáticamente: ${err.message}`,
+                "warning"
+              );
+            });
+
+            updateStatus("🔊 Escuchando al agente...", "listening");
+            addLog("✅ Audio del agente configurado", "info");
+          }
+        });
+
+        // Evento: Track sin publicar
+        sala.on("trackUnsubscribed", (track, publication, participant) => {
+          addLog(
+            `🎧 Track perdido de ${participant.identity}: ${track.kind}`,
+            "warning"
+          );
+        });
+
+        // Evento: Desconexión
+        sala.on("disconnected", () => {
+          addLog("📴 Desconectado de la sala", "warning");
+          updateStatus("Desconectado", "");
+        });
+
+        // Evento: Error
+        sala.on("error", (error) => {
+          addLog(`❌ Error en sala: ${error.message}`, "error");
+        });
+
+        // Evento: Participant disconnected
+        sala.on("participantDisconnected", (participant) => {
+          addLog(
+            `👤 Participante desconectado: ${participant.identity}`,
+            "warning"
+          );
+        });
+
+        addLog("🎯 Eventos configurados", "info");
+      }
+
+      // === DESCONEXIÓN ===
+      async function desconectar() {
+        try {
+          addLog("📴 Desconectando...", "info");
+
+          if (sala) {
+            await sala.disconnect();
+            sala = null;
+            addLog("✅ Desconectado correctamente", "info");
+          }
+
+          // Resetear UI
+          updateStatus("Desconectado", "");
+          connectBtn.disabled = false;
+          disconnectBtn.disabled = true;
+
+          // Limpiar audio
+          audioEl.srcObject = null;
+
+          addLog("🔄 UI reseteada", "info");
+        } catch (err) {
+          addLog(`❌ Error al desconectar: ${err.message}`, "error");
+          sala = null;
+          connectBtn.disabled = false;
+          disconnectBtn.disabled = true;
+        }
+      }
+
+      // === INICIALIZACIÓN ===
+      window.addEventListener("load", () => {
+        addLog("🚀 Página cargada", "info");
+
+        // Verificar LiveKit
+        if (window.LivekitClient) {
+          addLog("✅ LiveKit Client disponible", "info");
+        } else {
+          addLog("❌ LiveKit Client NO disponible", "error");
+          addLog(
+            "💡 Solución: Recarga la página o verifica tu conexión a internet",
+            "warning"
+          );
+        }
+
+        // Verificar URL del servidor
+        checkServer();
+      });
+
+      async function checkServer() {
+        try {
+          const res = await fetch("http://localhost:5000/health");
+          const data = await res.json();
+
+          if (data.status === "ok") {
+            addLog(`✅ Servidor disponible: ${data.service}`, "info");
+            addLog(`🔗 LiveKit URL: ${data.livekit_url}`, "info");
+          } else {
+            addLog("⚠️ Servidor responde pero con estado diferente", "warning");
+          }
+        } catch (err) {
+          addLog(`❌ Servidor no disponible: ${err.message}`, "error");
+          addLog("💡 Asegúrate de ejecutar: python server.py", "warning");
+          updateStatus("❌ Servidor no disponible", "error");
+        }
+      }
+    </script>
+  </body>
+</html>
