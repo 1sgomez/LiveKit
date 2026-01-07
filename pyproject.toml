@@ -28,6 +28,8 @@ dependencies = [
     "openai-whisper",                             #CUDA, comentar si no GPU nvidia
     "piper-tts",                                  #Se cambia piper-tts por gtts
     "gtts",
+    "soundfile",                                  #Conversion audio crudo a wav
+    "pydub",
 
     # Web / API
     "flask",
@@ -36,6 +38,8 @@ dependencies = [
 
     # Config
     "python-dotenv",
+    "aiohttp",
+    "librosa",
 ]
 
 [dependency-groups]

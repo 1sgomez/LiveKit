@@ -15,7 +15,11 @@ Requires-Dist: livekit-plugins-silero
 Requires-Dist: openai-whisper
 Requires-Dist: piper-tts
 Requires-Dist: gtts
+Requires-Dist: soundfile
+Requires-Dist: pydub
 Requires-Dist: flask
 Requires-Dist: flask-cors
 Requires-Dist: requests
 Requires-Dist: python-dotenv
+Requires-Dist: aiohttp
+Requires-Dist: librosa

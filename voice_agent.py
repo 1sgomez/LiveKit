@@ -1,7 +1,5 @@
 # voice_agent.py - Agente de voz 100% local con LiveKit
-# Uso:
-#   Modo worker: python voice_agent.py (espera trabajos de LiveKit)
-#   Modo directo: python voice_agent.py --direct (se conecta directamente a la sala)
+# Uso: python voice_agent.py --direct
 
 import asyncio
 import logging
@@ -13,6 +11,12 @@ import argparse
 from typing import Optional
 import numpy as np
 import requests
+import soundfile as sf
+import tempfile
+from pydub import AudioSegment
+import aiohttp
+from collections import deque
+import librosa
 
 # Importaciones de LiveKit
 from livekit import rtc
@@ -22,7 +26,6 @@ from livekit.agents import (
     WorkerOptions,
     cli,
 )
-from livekit.plugins import silero
 
 # Importaciones de modelos
 import whisper
@@ -52,9 +55,24 @@ LIVEKIT_API_KEY = os.getenv('LIVEKIT_API_KEY')
 LIVEKIT_API_SECRET = os.getenv('LIVEKIT_API_SECRET')
 LIVEKIT_ROOM = os.getenv('LIVEKIT_ROOM', 'test')
 
+class SimpleVAD:
+    """Detector de actividad de voz simple basado en energía"""
+
+    def __init__(self, threshold: float = 0.02, sample_rate: int = 16000):
+        self.threshold = threshold
+        self.sample_rate = sample_rate
+
+    def is_speech(self, audio_data: np.ndarray) -> bool:
+        """Detectar si hay voz basada en energía"""
+        # Calcular RMS (Root Mean Square) - medida de volumen
+        rms = np.sqrt(np.mean(audio_data ** 2))
+        return rms > self.threshold
 
 class LocalVoiceAgent:
-    def __init__(self, room_name: str):
+    def __init__(self, room_name: str, use_simple_vad: bool = False):
+        # Buffer de pre-roll (~300 ms)
+        self.preroll_buffer = deque(maxlen=10)
+
         self.room_name = room_name
         self.ctx_room = None
         self.conversation_history = []
@@ -62,102 +80,175 @@ class LocalVoiceAgent:
         self.is_processing = False
         self.silence_detected = False
         self.greeting_sent = False
+        self.use_simple_vad = use_simple_vad
 
+        # Cargar modelos
         logger.info("📥 Cargando Whisper (STT)...")
-        self.whisper_model = whisper.load_model("base")
+        self.whisper_model = whisper.load_model("small")
 
-        logger.info("📥 Cargando VAD (Silero)...")
-        self.vad = silero.VAD.load()
+        # Intentar cargar Silero VAD
+        self.vad = None
+        self.simple_vad = SimpleVAD(threshold=0.004, sample_rate=16000)
 
-        logger.info("✅ Modelos cargados correctamente")
+        try:
+            from livekit.plugins import silero
+            logger.info("📥 Cargando Silero VAD...")
+            self.vad = silero.VAD.load()
+            logger.info("✅ Silero VAD cargado")
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo cargar Silero VAD: {e}")
+            logger.info("   Usando detector de volumen simple")
+
+        logger.info("✅ Modelos cargados")
 
     async def connect(self, url: str, token: str):
         """Conectar directamente a una sala"""
         logger.info(f"🔌 Conectando a la sala {self.room_name}...")
 
-        # Crear Room de LiveKit
         self.ctx_room = rtc.Room()
 
-        # Configurar eventos
         self.ctx_room.on("track_subscribed", self.on_track_subscribed)
         self.ctx_room.on("participant_connected", self.on_participant_connected)
         self.ctx_room.on("connected", self.on_connected)
 
-        # Conectar
         await self.ctx_room.connect(url, token)
 
         logger.info(f"✅ Conectado a {self.room_name}")
         logger.info(f"👤 Identity: {self.ctx_room.local_participant.identity}")
 
-    async def transcribe_audio(self, audio_data: bytes) -> str:
-        """Transcribir audio con Whisper"""
-        try:
-            audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            result = self.whisper_model.transcribe(audio_np, language="es")
-            text = result["text"].strip()
+    def detect_speech(self, audio_data: np.ndarray) -> bool:
+        """Detectar si hay voz"""
+        if self.vad is not None:
+            try:
+                # Intentar API de Silero VAD
+                if hasattr(self.vad, 'is_speech'):
+                    return self.vad.is_speech(audio_data, sample_rate=16000)
+                elif callable(self.vad):
+                    # Nueva API: VAD es un callable
+                    return self.vad(audio_data, sample_rate=16000) > 0.5
+            except Exception as e:
+                logger.debug(f"VAD error, usando fallback: {e}")
 
+        # Fallback: usar detector simple por volumen
+        return self.simple_vad.is_speech(audio_data)
+
+    async def transcribe_audio(self, audio_data: bytes, input_sample_rate: int) -> str:
+        try:
+            # PCM int16 → float32
+            audio_np = (
+                np.frombuffer(audio_data, dtype=np.int16)
+                .astype(np.float32) / 32768.0
+            )
+
+            # Resample REAL → 16 kHz (OBLIGATORIO)
+            if input_sample_rate != 16000:
+                audio_np = librosa.resample(
+                    audio_np,
+                    orig_sr=input_sample_rate,
+                    target_sr=16000
+                )
+
+            # Guardar WAV correcto
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                wav_path = f.name
+                sf.write(wav_path, audio_np, 16000, subtype="PCM_16")
+
+            result = self.whisper_model.transcribe(
+                wav_path,
+                language="es",
+                task="transcribe",
+                initial_prompt="Conversación en español. El usuario habla con un asistente llamado Jarvis.",
+                temperature=0.0,
+                fp16=False
+            )
+
+            os.unlink(wav_path)
+
+            text = result["text"].strip()
             if text:
                 logger.info(f"👤 Usuario: {text}")
+
             return text
 
         except Exception as e:
             logger.error(f"❌ Error en transcripción: {e}")
             return ""
 
+
     async def generate_response(self, user_message: str) -> str:
-        """Generar respuesta con Ollama"""
         try:
-            self.conversation_history.append({"role": "user", "content": user_message})
+            self.conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
 
             if len(self.conversation_history) > 10:
                 self.conversation_history = self.conversation_history[-10:]
 
-            response = requests.post(
-                "http://localhost:11434/api/chat",
-                json={
-                    "model": "llama3.2:3b",
-                    "messages": [
-                        {"role": "system", "content": "Eres Jarvis, asistente de voz conciso en español."},
-                        *self.conversation_history
-                    ],
-                    "stream": False
-                },
-                timeout=30
-            )
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "http://localhost:11434/api/chat",
+                    json={
+                        "model": "llama3.2:3b",
+                            "options": {
+                            "temperature": 0.2,
+                            "top_p": 0.9,
+                            "num_predict": 60,
+                            "repeat_penalty": 1.2
+                        },
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content":
+                                "Eres Jarvis, un asistente de voz."
+                                "Respondes SOLO en español."
+                                "Tus respuestas son cortas (máx 2 frases)."
+                                "Hablas de forma natural y directa."
+                                "No explicas limitaciones técnicas."
+                                "No mencionas que eres un modelo de lenguaje."
+                                "Si no tienes un dato, dilo de forma breve y humana."
+                            },
+                            *self.conversation_history
+                        ],
+                        "stream": False
+                    },
+                    timeout=aiohttp.ClientTimeout(total=120)
+                ) as resp:
 
-            if response.status_code == 200:
-                result = response.json()
-                assistant_message = result["message"]["content"].strip()
-                self.conversation_history.append({"role": "assistant", "content": assistant_message})
-                logger.info(f"🤖 Jarvis: {assistant_message}")
-                return assistant_message
+                    result = await resp.json()
+                    assistant_message = result["message"]["content"].strip()
 
-            return "Disculpa, tuve un problema."
+                    # MAX_WORDS = 35
+                    # words = assistant_message.split()
+
+                    # if len(words) > MAX_WORDS:
+                    #     assistant_message = "Claro. ¿Qué necesitas saber exactamente?"
+
+                    self.conversation_history.append(
+                        {"role": "assistant", "content": assistant_message}
+                    )
+
+                    logger.info(f"🤖 Jarvis: {assistant_message}")
+                    return assistant_message
 
         except Exception as e:
-            logger.error(f"❌ Error con Ollama: {e}")
-            return "No puedo conectar con el servidor de IA."
+            logger.error(f"❌ Error con Ollama (async): {e}")
+            return "No puedo responder en este momento."
 
     async def synthesize_speech(self, text: str) -> Optional[bytes]:
-        """Sintetizar voz con gTTS"""
         try:
-            logger.info(f"🔊 Generando audio: {text[:50]}...")
+            tts = gTTS(text=text, lang='es')
 
-            tts = gTTS(text=text, lang='es', slow=False)
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                mp3_path = f.name
+                tts.save(mp3_path)
 
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as fp:
-                temp_file = fp.name
-                tts.save(temp_file)
+            audio = AudioSegment.from_mp3(mp3_path).set_frame_rate(16000).set_channels(1)
+            os.unlink(mp3_path)
 
-                with open(temp_file, 'rb') as f:
-                    audio_data = f.read()
-
-                os.unlink(temp_file)
-
-            return audio_data
+            return audio.raw_data
 
         except Exception as e:
-            logger.error(f"❌ Error sintetizando: {e}")
+            logger.error(f"❌ Error TTS: {e}")
             return None
 
     async def publish_audio(self, audio_data: bytes):
@@ -204,63 +295,97 @@ class LocalVoiceAgent:
             self.greeting_sent = True
 
     async def handle_audio_stream(self, track: rtc.Track, participant: rtc.RemoteParticipant):
-        """Procesar audio del usuario"""
         if self.is_processing:
             return
 
         self.is_processing = True
         self.audio_buffer = []
+        self.preroll_buffer.clear()
         self.silence_detected = False
         silence_start = None
+        speech_detected = False
+        input_sample_rate = None
 
-        logger.info(f"🎤 Procesando de {participant.identity}")
+        logger.info(f"🎤 Escuchando a {participant.identity}...")
 
         audio_stream = rtc.AudioStream(track)
+        silence_timeout = 1  # segundos
 
         try:
             async for frame_event in audio_stream:
                 current_time = asyncio.get_event_loop().time()
 
-                audio_data = np.frombuffer(
-                    frame_event.frame.data,
-                    dtype=np.int16
-                ).astype(np.float32) / 32768.0
+                input_sample_rate = frame_event.frame.sample_rate
 
-                is_speech = self.vad.is_speech(audio_data, sample_rate=16000)
+                audio_data = (
+                    np.frombuffer(frame_event.frame.data, dtype=np.int16)
+                    .astype(np.float32) / 32768.0
+                )
+
+                # Guardar siempre pre-roll
+                self.preroll_buffer.append(frame_event.frame.data)
+
+                is_speech = self.detect_speech(audio_data)
 
                 if is_speech:
+                    if not speech_detected:
+                        # Primer frame de voz → agregar pre-roll
+                        self.audio_buffer.extend(self.preroll_buffer)
+                        logger.debug("🎙️ Pre-roll agregado")
+
                     self.audio_buffer.append(frame_event.frame.data)
                     self.silence_detected = False
                     silence_start = None
+                    speech_detected = True
+
                 else:
-                    if not self.silence_detected:
-                        self.silence_detected = True
-                        silence_start = current_time
-                    elif silence_start and (current_time - silence_start) >= 1.0 and len(self.audio_buffer) > 0:
-                        logger.info("🛑 Silencio detectado")
-                        break
+                    if speech_detected:
+                        if not self.silence_detected:
+                            self.silence_detected = True
+                            silence_start = current_time
+                        elif silence_start and (current_time - silence_start) >= silence_timeout:
+                            logger.info(
+                                f"🛑 Fin del habla ({current_time - silence_start:.2f}s silencio)"
+                            )
+                            break
 
-            if len(self.audio_buffer) > 0:
-                audio_bytes = b''.join(self.audio_buffer)
+            if self.audio_buffer:
+                logger.info(f"📝 Procesando {len(self.audio_buffer)} frames de audio...")
 
-                text = await self.transcribe_audio(audio_bytes)
+                audio_bytes = b"".join(self.audio_buffer)
+
+                text = await self.transcribe_audio(audio_bytes, input_sample_rate)
+
                 if text:
                     response = await self.generate_response(text)
                     audio_response = await self.synthesize_speech(response)
                     if audio_response:
                         await self.publish_audio(audio_response)
+                else:
+                    logger.info("🤷 Whisper no detectó texto")
 
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
+            logger.error(f"❌ Error procesando audio: {e}")
+            import traceback
+            traceback.print_exc()
+
         finally:
             self.is_processing = False
             self.audio_buffer = []
 
+    async def listen_loop(self, track: rtc.Track, participant: rtc.RemoteParticipant):
+        while True:
+            try:
+                await self.handle_audio_stream(track, participant)
+                await asyncio.sleep(0.3)  # pequeño respiro entre turnos
+            except Exception as e:
+                logger.error(f"❌ Error en loop de escucha: {e}")
+                await asyncio.sleep(1)
+
     def on_track_subscribed(self, track: rtc.Track, publication, participant: rtc.RemoteParticipant):
-        """Callback: track recibido"""
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"🎧 Audio de {participant.identity}")
-            asyncio.ensure_future(self.handle_audio_stream(track, participant))
+            asyncio.ensure_future(self.listen_loop(track, participant))
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
         """Callback: participante conectado"""
@@ -314,7 +439,6 @@ async def run_direct_mode():
         logger.error("❌ Dependencias no disponibles")
         return
 
-    # Obtener token directamente
     import time
     participant_name = f"agent-{int(time.time())}"
 
@@ -338,7 +462,6 @@ async def run_direct_mode():
         logger.info(f"✅ Token recibido")
         logger.info(f"🔗 URL: {url}")
 
-        # Crear agente y conectar
         agent = LocalVoiceAgent(LIVEKIT_ROOM)
         await agent.connect(url, token)
         await agent.run()
@@ -372,13 +495,11 @@ async def entrypoint(ctx: JobContext):
         agent = LocalVoiceAgent(ctx.room.name)
         agent.ctx_room = ctx.room
 
-        # Configurar callbacks
         ctx.room.on("track_subscribed", agent.on_track_subscribed)
         ctx.room.on("participant_connected", agent.on_participant_connected)
         ctx.room.on("connected", agent.on_connected)
 
         logger.info(f"📍 Conectado a: {ctx.room.name}")
-        logger.info("⏳ Esperando participantes...")
         await asyncio.sleep(float('inf'))
 
     except Exception as e:
@@ -390,6 +511,8 @@ def main():
     parser = argparse.ArgumentParser(description="Agente de voz Jarvis")
     parser.add_argument("--direct", action="store_true",
                        help="Modo directo: conectar directamente a la sala")
+    parser.add_argument("--simple-vad", action="store_true",
+                       help="Usar detector de volumen simple en lugar de Silero VAD")
     args = parser.parse_args()
 
     print('='*60)
@@ -401,14 +524,12 @@ def main():
     print(f"   LIVEKIT_ROOM: {LIVEKIT_ROOM}")
     print()
 
-    # Verificar configuración
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         print("❌ ERROR: Faltan LIVEKIT_API_KEY o LIVEKIT_API_SECRET")
         sys.exit(1)
 
     if args.direct:
-        # Modo directo
-        print("🎯 MODO: Directo (conectar directamente a la sala)")
+        print("🎯 MODO: Directo")
         print("   El agente se conectará inmediatamente a la sala")
         print()
 
@@ -417,10 +538,8 @@ def main():
         except KeyboardInterrupt:
             print("\n👋 Agente detenido")
     else:
-        # Modo worker (espera trabajos)
-        print("🎯 MODO: Worker (esperando trabajos de LiveKit)")
-        print("   El agente esperará a que LiveKit le envíe trabajos")
-        print("   NOTA: Tu versión de LiveKit puede no soportar workers")
+        print("🎯 MODO: Worker")
+        print("   El agente esperará trabajos de LiveKit")
         print()
 
         try:

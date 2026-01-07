@@ -10,7 +10,11 @@ livekit-plugins-silero
 openai-whisper
 piper-tts
 gtts
+soundfile
+pydub
 flask
 flask-cors
 requests
 python-dotenv
+aiohttp
+librosa
