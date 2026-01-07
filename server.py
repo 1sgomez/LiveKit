@@ -7,6 +7,7 @@ from flask_cors import CORS
 from livekit import api
 from dotenv import load_dotenv
 from datetime import timedelta
+import json
 
 # Cargar variables de entorno
 load_dotenv()
@@ -16,8 +17,11 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Configuración - IMPORTANTE: ws:// para WebSocket
 LIVEKIT_URL = os.getenv('LIVEKIT_URL', 'ws://localhost:7880')
+LIVEKIT_ROOM = os.getenv('LIVEKIT_ROOM', 'test')
 LIVEKIT_API_KEY = os.getenv('LIVEKIT_API_KEY')
 LIVEKIT_API_SECRET = os.getenv('LIVEKIT_API_SECRET')
+
+tool_data_storage = {}
 
 print(f"🚀 LiveKit Server Config: {LIVEKIT_URL}")
 print(f"🔑 API Key: {LIVEKIT_API_KEY[:10] if LIVEKIT_API_KEY else 'None'}...")
@@ -143,6 +147,105 @@ def create_room():
         print(f"❌ Error creando sala: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/settings', methods=['GET', 'POST'])
+def settings():
+    """Gestionar configuración de settings"""
+    if request.method == 'POST':
+        data = request.json or {}
+        # Aquí puedes guardar la configuración en una base de datos o archivo
+        print(f"📝 Configuración recibida: {data}")
+        return jsonify({
+            'status': 'ok',
+            'message': 'Configuración guardada correctamente'
+        })
+    else:
+        # Aquí puedes devolver la configuración actual
+        return jsonify({
+            'status': 'ok',
+            'settings': {
+                'livekit_url': LIVEKIT_URL,
+                'room': LIVEKIT_ROOM
+            }
+        })
+
+
+@app.route('/tool-data', methods=['POST'])
+def tool_data():
+    """Recibir datos de herramientas y enviarlos al agente vía Data Message"""
+    try:
+        data = request.json or {}
+        room_name = data.get('room', LIVEKIT_ROOM)
+        tool_name = data.get('tool_name', 'unknown')
+        tool_data = data.get('data', {})
+        user_identity = data.get('user_identity')
+
+        print(f"🛠️ Datos de herramienta recibidos:")
+        print(f"   Sala: {room_name}")
+        print(f"   Herramienta: {tool_name}")
+        print(f"   Usuario: {user_identity}")
+        print(f"   Datos: {json.dumps(tool_data, indent=2)}")
+
+        # Almacenar en memoria
+        storage_key = f"{room_name}:{tool_name}"
+        tool_data_storage[storage_key] = tool_data
+
+        # Enviar data message al agente
+        try:
+            room_service = api.RoomServiceClient(
+                LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+            )
+
+            payload = json.dumps({
+                'type': 'tool_data',
+                'tool_name': tool_name,
+                'data': tool_data,
+                'user_identity': user_identity
+            })
+
+            room_service.send_data(api.SendDataRequest(
+                room=room_name,
+                data=payload.encode('utf-8'),
+                kind=api.DataPacket.Kind.RELIABLE
+            ))
+
+            print(f"✅ Data message enviado al agente en sala '{room_name}'")
+
+        except Exception as e:
+            print(f"⚠️ No se pudo enviar data message: {e}")
+
+        return jsonify({
+            'status': 'ok',
+            'message': 'Datos de herramientas procesados correctamente',
+            'tool_name': tool_name,
+            'storage_key': storage_key
+        })
+
+    except Exception as e:
+        print(f"❌ Error procesando datos de herramientas: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/tool-data/<room_name>', methods=['GET'])
+def get_tool_data(room_name):
+    """🆕 ENDPOINT NUEVO - Consultar datos almacenados"""
+    try:
+        matching_data = {}
+        prefix = f"{room_name}:"
+
+        for key, value in tool_data_storage.items():
+            if key.startswith(prefix):
+                tool_name = key.replace(prefix, '')
+                matching_data[tool_name] = value
+
+        return jsonify({
+            'status': 'ok',
+            'room': room_name,
+            'tools': matching_data
+        })
+
+    except Exception as e:
+        print(f"❌ Error obteniendo datos: {e}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('FLASK_PORT', 5000))

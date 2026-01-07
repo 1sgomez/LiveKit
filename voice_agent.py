@@ -12,11 +12,11 @@ from typing import Optional
 import numpy as np
 import requests
 import soundfile as sf
-import tempfile
 from pydub import AudioSegment
 import aiohttp
 from collections import deque
 import librosa
+import json  # 🆕 Para parsear data messages
 
 # Importaciones de LiveKit
 from livekit import rtc
@@ -64,7 +64,6 @@ class SimpleVAD:
 
     def is_speech(self, audio_data: np.ndarray) -> bool:
         """Detectar si hay voz basada en energía"""
-        # Calcular RMS (Root Mean Square) - medida de volumen
         rms = np.sqrt(np.mean(audio_data ** 2))
         return rms > self.threshold
 
@@ -81,6 +80,9 @@ class LocalVoiceAgent:
         self.silence_detected = False
         self.greeting_sent = False
         self.use_simple_vad = use_simple_vad
+
+        # 🆕 SOLO agregamos esto para herramientas
+        self.tool_data = {}  # Datos de herramientas recibidos
 
         # Cargar modelos
         logger.info("📥 Cargando Whisper (STT)...")
@@ -110,6 +112,8 @@ class LocalVoiceAgent:
         self.ctx_room.on("track_subscribed", self.on_track_subscribed)
         self.ctx_room.on("participant_connected", self.on_participant_connected)
         self.ctx_room.on("connected", self.on_connected)
+        self.ctx_room.on("data_received", self.on_data_received)  # 🆕 Agregar listener
+        logger.info("✅ Listeners registrados (incluido data_received)")  # 🔍 Debug
 
         await self.ctx_room.connect(url, token)
 
@@ -120,27 +124,56 @@ class LocalVoiceAgent:
         """Detectar si hay voz"""
         if self.vad is not None:
             try:
-                # Intentar API de Silero VAD
                 if hasattr(self.vad, 'is_speech'):
                     return self.vad.is_speech(audio_data, sample_rate=16000)
                 elif callable(self.vad):
-                    # Nueva API: VAD es un callable
                     return self.vad(audio_data, sample_rate=16000) > 0.5
             except Exception as e:
                 logger.debug(f"VAD error, usando fallback: {e}")
 
-        # Fallback: usar detector simple por volumen
         return self.simple_vad.is_speech(audio_data)
+
+    # 🆕 NUEVA FUNCIÓN: Recibir data messages
+    def on_data_received(self, data_packet: rtc.DataPacket):
+        """Callback: Recibir mensajes de datos del frontend"""
+        logger.info("📨 Data packet recibido (RAW)")  # 🔍 Debug
+        try:
+            payload_str = data_packet.data.decode('utf-8')
+            logger.info(f"📨 Payload decodificado: {payload_str[:200]}")  # 🔍 Debug
+            payload = json.loads(payload_str)
+
+            if payload.get('type') == 'tool_data':
+                tool_name = payload.get('tool_name', 'unknown')
+                tool_data = payload.get('data', {})
+
+                logger.info(f"🛠️ Tool recibida: {tool_name}")
+                logger.info(f"   Datos completos: {json.dumps(tool_data, indent=2, ensure_ascii=False)}")
+
+                # Guardar datos
+                self.tool_data[tool_name] = tool_data
+
+                # 🔥 Agregar DATOS COMPLETOS al contexto
+                context_msg = f"[Datos de {tool_name}]\n"
+                context_msg += json.dumps(tool_data, indent=2, ensure_ascii=False)
+                context_msg += "\n\nUsa esta información para responder preguntas sobre estos campos/formularios."
+
+                self.conversation_history.append({
+                    "role": "system",
+                    "content": context_msg
+                })
+
+                logger.info(f"✅ Datos agregados al contexto (sin procesar)")
+
+        except Exception as e:
+            logger.error(f"❌ Error procesando data message: {e}")
 
     async def transcribe_audio(self, audio_data: bytes, input_sample_rate: int) -> str:
         try:
-            # PCM int16 → float32
             audio_np = (
                 np.frombuffer(audio_data, dtype=np.int16)
                 .astype(np.float32) / 32768.0
             )
 
-            # Resample REAL → 16 kHz (OBLIGATORIO)
             if input_sample_rate != 16000:
                 audio_np = librosa.resample(
                     audio_np,
@@ -148,7 +181,6 @@ class LocalVoiceAgent:
                     target_sr=16000
                 )
 
-            # Guardar WAV correcto
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 wav_path = f.name
                 sf.write(wav_path, audio_np, 16000, subtype="PCM_16")
@@ -174,7 +206,6 @@ class LocalVoiceAgent:
             logger.error(f"❌ Error en transcripción: {e}")
             return ""
 
-
     async def generate_response(self, user_message: str) -> str:
         try:
             self.conversation_history.append(
@@ -184,12 +215,26 @@ class LocalVoiceAgent:
             if len(self.conversation_history) > 10:
                 self.conversation_history = self.conversation_history[-10:]
 
+            # 🆕 Mejorar info de herramientas al system prompt
+            tool_context = ""
+            if self.tool_data:
+                tool_context = "\n\n=== INFORMACIÓN IMPORTANTE ===\n"
+                tool_context += "Tienes acceso a datos de campos/formularios:\n\n"
+
+                for t_name, t_data in self.tool_data.items():
+                    tool_context += f"• {t_name}:\n"
+                    tool_context += json.dumps(t_data, indent=2, ensure_ascii=False)
+                    tool_context += "\n\n"
+
+                tool_context += "INSTRUCCIÓN: Cuando el usuario pregunte sobre campos, nombres o descripciones, "
+                tool_context += "usa EXACTAMENTE la información de arriba. No inventes ni supongas nada."
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     "http://localhost:11434/api/chat",
                     json={
                         "model": "llama3.2:3b",
-                            "options": {
+                        "options": {
                             "temperature": 0.2,
                             "top_p": 0.9,
                             "num_predict": 60,
@@ -199,13 +244,16 @@ class LocalVoiceAgent:
                             {
                                 "role": "system",
                                 "content":
-                                "Eres Jarvis, un asistente de voz."
-                                "Respondes SOLO en español."
-                                "Tus respuestas son cortas (máx 2 frases)."
-                                "Hablas de forma natural y directa."
-                                "No explicas limitaciones técnicas."
-                                "No mencionas que eres un modelo de lenguaje."
-                                "Si no tienes un dato, dilo de forma breve y humana."
+                                "Eres Jarvis, un asistente de voz. "
+                                "Respondes SOLO en español. "
+                                "Tus respuestas son cortas (máx 2-3 frases). "
+                                "Hablas de forma natural y directa. "
+                                "No explicas limitaciones técnicas. "
+                                "Cuando tengas información de campos/formularios en el contexto, "
+                                "úsala EXACTAMENTE como te la proporcionan. "
+                                "Si te preguntan por un campo específico, busca ese nombre en los datos "
+                                "y responde con su descripción."
+                                + tool_context  # 🆕 Agregar contexto de herramientas
                             },
                             *self.conversation_history
                         ],
@@ -217,12 +265,6 @@ class LocalVoiceAgent:
                     result = await resp.json()
                     assistant_message = result["message"]["content"].strip()
 
-                    # MAX_WORDS = 35
-                    # words = assistant_message.split()
-
-                    # if len(words) > MAX_WORDS:
-                    #     assistant_message = "Claro. ¿Qué necesitas saber exactamente?"
-
                     self.conversation_history.append(
                         {"role": "assistant", "content": assistant_message}
                     )
@@ -231,7 +273,7 @@ class LocalVoiceAgent:
                     return assistant_message
 
         except Exception as e:
-            logger.error(f"❌ Error con Ollama (async): {e}")
+            logger.error(f"❌ Error con Ollama: {e}")
             return "No puedo responder en este momento."
 
     async def synthesize_speech(self, text: str) -> Optional[bytes]:
@@ -309,7 +351,7 @@ class LocalVoiceAgent:
         logger.info(f"🎤 Escuchando a {participant.identity}...")
 
         audio_stream = rtc.AudioStream(track)
-        silence_timeout = 1  # segundos
+        silence_timeout = 1
 
         try:
             async for frame_event in audio_stream:
@@ -322,14 +364,12 @@ class LocalVoiceAgent:
                     .astype(np.float32) / 32768.0
                 )
 
-                # Guardar siempre pre-roll
                 self.preroll_buffer.append(frame_event.frame.data)
 
                 is_speech = self.detect_speech(audio_data)
 
                 if is_speech:
                     if not speech_detected:
-                        # Primer frame de voz → agregar pre-roll
                         self.audio_buffer.extend(self.preroll_buffer)
                         logger.debug("🎙️ Pre-roll agregado")
 
@@ -377,7 +417,7 @@ class LocalVoiceAgent:
         while True:
             try:
                 await self.handle_audio_stream(track, participant)
-                await asyncio.sleep(0.3)  # pequeño respiro entre turnos
+                await asyncio.sleep(0.3)
             except Exception as e:
                 logger.error(f"❌ Error en loop de escucha: {e}")
                 await asyncio.sleep(1)
@@ -498,6 +538,7 @@ async def entrypoint(ctx: JobContext):
         ctx.room.on("track_subscribed", agent.on_track_subscribed)
         ctx.room.on("participant_connected", agent.on_participant_connected)
         ctx.room.on("connected", agent.on_connected)
+        ctx.room.on("data_received", agent.on_data_received)  # 🆕 Agregar
 
         logger.info(f"📍 Conectado a: {ctx.room.name}")
         await asyncio.sleep(float('inf'))
